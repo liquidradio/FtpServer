@@ -31,14 +31,27 @@ namespace FubarDev.FtpServer
     /// </summary>
     public sealed class FtpServer : IDisposable
     {
+        private static object startedLock = new object();
+
+        /// <summary>
+        /// Mutext for Stopped field.
+        /// </summary>
+        private readonly object _stopLocker = new object();
+
         private readonly CancellationTokenSource _cancellationTokenSource = new CancellationTokenSource();
 
         private readonly ConcurrentHashSet<FtpConnection> _connections = new ConcurrentHashSet<FtpConnection>();
 
+        /// <summary>
+        /// Don't use this directly, use the Stopped property instead. It is protected by a mutex.
+        /// </summary>
         private bool _stopped;
 
         private ConfiguredTaskAwaitable _listenerTask;
+
         private AutoResetEvent _listenerTaskEvent = new AutoResetEvent(false);
+
+        private volatile bool _isReady = false;
 
         private IFtpLog _log;
 
@@ -61,6 +74,18 @@ namespace FubarDev.FtpServer
         /// <param name="serverAddress">The public IP address (required for <code>PASV</code> and <code>EPSV</code>)</param>
         public FtpServer([NotNull] IFileSystemClassFactory fileSystemClassFactory, [NotNull] IMembershipProvider membershipProvider, [NotNull] string serverAddress)
             : this(fileSystemClassFactory, membershipProvider, serverAddress, 21, new AssemblyFtpCommandHandlerFactory(typeof(FtpServer).GetTypeInfo().Assembly))
+        {
+        }
+
+        /// <summary>
+        /// Initializes a new instance of the <see cref="FtpServer"/> class.
+        /// </summary>
+        /// <param name="fileSystemClassFactory">The <see cref="IFileSystemClassFactory"/> to use to create the <see cref="IUnixFileSystem"/> for the logged in user.</param>
+        /// <param name="membershipProvider">The <see cref="IMembershipProvider"/> used to validate a login attempt</param>
+        /// <param name="serverAddress">The public IP address (required for <code>PASV</code> and <code>EPSV</code>)</param>
+        /// <param name="port">The port of the FTP server (usually 21)</param>
+        public FtpServer([NotNull] IFileSystemClassFactory fileSystemClassFactory, [NotNull] IMembershipProvider membershipProvider, [NotNull] string serverAddress, int port)
+            : this(fileSystemClassFactory, membershipProvider, serverAddress, port, new AssemblyFtpCommandHandlerFactory(typeof(FtpServer).GetTypeInfo().Assembly))
         {
         }
 
@@ -157,15 +182,59 @@ namespace FubarDev.FtpServer
         [CanBeNull]
         public IFtpLogManager LogManager { get; set; }
 
+        /// <summary>
+        /// Gets or sets a value indicating whether server ready to receive incoming connectoions
+        /// </summary>
+        public bool Ready
+        {
+            get
+            {
+                lock (startedLock)
+                {
+                    return _isReady;
+                }
+            }
+
+            set
+            {
+                lock (startedLock)
+                {
+                    _isReady = value;
+                }
+            }
+        }
+
         private BackgroundTransferWorker BackgroundTransferWorker { get; }
+
+        /// <summary>
+        /// The Stopped property. Mutexed so it can be accessed concurrently by different threads.
+        /// </summary>
+        private bool Stopped
+        {
+            get
+            {
+                lock (_stopLocker)
+                {
+                    return _stopped;
+                }
+            }
+            set
+            {
+                lock (_stopLocker)
+                {
+                    _stopped = value;
+                }
+            }
+        }
 
         /// <summary>
         /// Starts the FTP server in the background
         /// </summary>
         public void Start()
         {
-            if (_stopped)
+            if (Stopped)
                 throw new InvalidOperationException("Cannot start a previously stopped FTP server");
+            _listenerTaskEvent = new AutoResetEvent(false);
             _listenerTask = ExecuteServerListener(this._listenerTaskEvent).ConfigureAwait(false);
         }
 
@@ -179,7 +248,7 @@ namespace FubarDev.FtpServer
         {
             _cancellationTokenSource.Cancel(true);
             _listenerTaskEvent.Set();
-            _stopped = true;
+            Stopped = true;
         }
 
         /// <summary>
@@ -207,7 +276,7 @@ namespace FubarDev.FtpServer
         /// <inheritdoc/>
         public void Dispose()
         {
-            if (!_stopped)
+            if (!Stopped)
             {
                 Stop();
             }
@@ -239,15 +308,22 @@ namespace FubarDev.FtpServer
                 _log = LogManager?.CreateLog(typeof(FtpServer));
                 using (var listener = new TcpSocketListener(0))
                 {
-                    listener.ConnectionReceived = ConnectionReceived;
+                    listener.ConnectionReceived += ConnectionReceived;
                     try
                     {
                         e.Reset();
                         listener.StartListeningAsync(Port).Wait();
+                        Ready = true;
                         _log?.Debug("Server listening on port {0}", Port);
 
                         try
                         {
+                            // If we are already stoped, don't wait.
+                            if (Stopped)
+                            {
+                                return;
+                            }
+
                             e.WaitOne();
                         }
                         finally
@@ -262,8 +338,7 @@ namespace FubarDev.FtpServer
                         _log?.Fatal(ex, "{0}", ex.Message);
                     }
                 }
-            }
-            );
+            });
         }
 
         private void ConnectionReceived(object sender, TcpSocketListenerConnectEventArgs args)
@@ -280,7 +355,7 @@ namespace FubarDev.FtpServer
 
         private void ConnectionOnClosed(object sender, EventArgs eventArgs)
         {
-            if (_stopped)
+            if (Stopped)
                 return;
             var connection = (FtpConnection)sender;
             _connections.Remove(connection);
